@@ -1,0 +1,16 @@
+# VS Code
+.vscode/
+
+# CMake 编译目录
+build/
+
+# 编译产生的文件
+*.o
+*.a
+*.so
+
+# 备份文件
+*.bak
+
+# 日志文件
+*.log
