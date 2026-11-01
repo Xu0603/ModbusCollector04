@@ -23,6 +23,7 @@ add_executable(
     shared_memory.cpp
     system_manager.cpp
     time_utils.cpp
+    modbus_server.cpp
 )
 
 

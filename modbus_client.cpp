@@ -8,10 +8,11 @@
 #include <cstring>
 #include <sstream>
 #include <vector>
-#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <string>
+#include <cmath>
+#include <limits>
 
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -41,8 +42,6 @@ constexpr const char *MODBUS_HOST = "127.0.0.1";
 constexpr int MODBUS_PORT = 502;
 constexpr int SOCKET_TIMEOUT_MS = 2000;
 
-static int g_rawSocket = -1;
-static std::atomic<uint16_t> g_transactionId(1);
 
 
 // ============================================================
@@ -72,19 +71,6 @@ static std::string bytesToHex(
     return oss.str();
 }
 
-
-// ============================================================
-// 关闭原始 TCP socket
-// ============================================================
-
-static void closeRawSocket()
-{
-    if (g_rawSocket >= 0)
-    {
-        ::close(g_rawSocket);
-        g_rawSocket = -1;
-    }
-}
 
 
 // ============================================================
@@ -276,18 +262,93 @@ static bool recvAll(
 // 建立独立的原始 Modbus TCP 连接
 // ============================================================
 
-static bool connectRawSocket()
+static bool connectRawSocket(
+    ModbusTaskConnection &connection,
+    const std::string &host,
+    int port
+)
 {
-    if (g_rawSocket >= 0)
+    // ========================================================
+    // 当前任务已经连接到正确 endpoint
+    // ========================================================
+
+    if (
+        connection.socketFd >= 0
+        &&
+        connection.connectedHost == host
+        &&
+        connection.connectedPort == port
+    )
     {
         return true;
     }
 
-    int fd = ::socket(
-        AF_INET,
-        SOCK_STREAM,
-        0
-    );
+
+    // ========================================================
+    // 当前任务已有旧连接，先关闭
+    // ========================================================
+
+    if (connection.socketFd >= 0)
+    {
+        std::cout
+            << "[MODBUS] Task TCP endpoint 变化: "
+            << connection.connectedHost
+            << ":"
+            << connection.connectedPort
+            << " -> "
+            << host
+            << ":"
+            << port
+            << std::endl;
+
+
+        ::close(
+            connection.socketFd
+        );
+
+
+        connection.socketFd = -1;
+
+        connection.connectedHost.clear();
+
+        connection.connectedPort = -1;
+    }
+
+
+    // ========================================================
+    // 参数检查
+    // ========================================================
+
+    if (
+        host.empty()
+        ||
+        port <= 0
+        ||
+        port > 65535
+    )
+    {
+        std::cerr
+            << "[MODBUS] 非法 TCP 地址: "
+            << host
+            << ":"
+            << port
+            << std::endl;
+
+        return false;
+    }
+
+
+    // ========================================================
+    // 创建当前任务自己的 socket
+    // ========================================================
+
+    int fd =
+        ::socket(
+            AF_INET,
+            SOCK_STREAM,
+            0
+        );
+
 
     if (fd < 0)
     {
@@ -300,9 +361,12 @@ static bool connectRawSocket()
     }
 
 
-    // --------------------------------------------------------
-    // 设置发送/接收超时
-    // --------------------------------------------------------
+    // ========================================================
+    // Socket timeout
+    //
+    // 这一阶段继续保持原来的 2000ms。
+    // 后面再正式接入 task.timeout。
+    // ========================================================
 
     struct timeval timeout{};
 
@@ -310,7 +374,9 @@ static bool connectRawSocket()
         SOCKET_TIMEOUT_MS / 1000;
 
     timeout.tv_usec =
-        (SOCKET_TIMEOUT_MS % 1000) * 1000;
+        (SOCKET_TIMEOUT_MS % 1000)
+        *
+        1000;
 
 
     ::setsockopt(
@@ -331,26 +397,36 @@ static bool connectRawSocket()
     );
 
 
-    // --------------------------------------------------------
-    // 设置服务器地址
-    // --------------------------------------------------------
+    // ========================================================
+    // IPv4
+    // ========================================================
 
     struct sockaddr_in server{};
 
-    server.sin_family = AF_INET;
+    server.sin_family =
+        AF_INET;
 
     server.sin_port =
-        htons(MODBUS_PORT);
+        htons(
+            static_cast<uint16_t>(
+                port
+            )
+        );
 
 
-    if (::inet_pton(
+    if (
+        ::inet_pton(
             AF_INET,
-            MODBUS_HOST,
-            &server.sin_addr) != 1)
+            host.c_str(),
+            &server.sin_addr
+        )
+        !=
+        1
+    )
     {
         std::cerr
             << "[MODBUS] IP 地址无效: "
-            << MODBUS_HOST
+            << host
             << std::endl;
 
         ::close(fd);
@@ -359,20 +435,29 @@ static bool connectRawSocket()
     }
 
 
-    // --------------------------------------------------------
-    // TCP连接
-    // --------------------------------------------------------
+    // ========================================================
+    // 建立当前任务自己的 TCP 连接
+    // ========================================================
 
-    if (::connect(
+    if (
+        ::connect(
             fd,
-            reinterpret_cast<struct sockaddr *>(&server),
-            sizeof(server)) < 0)
+            reinterpret_cast<
+                struct sockaddr *
+            >(
+                &server
+            ),
+            sizeof(server)
+        )
+        <
+        0
+    )
     {
         std::cerr
             << "[MODBUS] 连接 "
-            << MODBUS_HOST
+            << host
             << ":"
-            << MODBUS_PORT
+            << port
             << " 失败: "
             << std::strerror(errno)
             << std::endl;
@@ -383,14 +468,23 @@ static bool connectRawSocket()
     }
 
 
-    g_rawSocket = fd;
+    connection.socketFd =
+        fd;
+
+    connection.connectedHost =
+        host;
+
+    connection.connectedPort =
+        port;
 
 
     std::cout
-        << "[MODBUS] 原始 TCP 通道连接成功: "
-        << MODBUS_HOST
+        << "[MODBUS] Task 独立 TCP 通道连接成功: "
+        << host
         << ":"
-        << MODBUS_PORT
+        << port
+        << " fd="
+        << connection.socketFd
         << std::endl;
 
 
@@ -402,22 +496,29 @@ static bool connectRawSocket()
 // Transaction ID
 // ============================================================
 
-static uint16_t nextTransactionId()
+static uint16_t nextTransactionId(
+    ModbusTaskConnection &connection
+)
 {
     uint16_t id =
-        g_transactionId.fetch_add(
-            1,
-            std::memory_order_relaxed
+        static_cast<uint16_t>(
+            connection.transactionId
         );
+
+
+    ++connection.transactionId;
+
+
+    // Transaction ID = 0 时跳过 0
+    if (connection.transactionId == 0)
+    {
+        connection.transactionId = 1;
+    }
 
 
     if (id == 0)
     {
-        id =
-            g_transactionId.fetch_add(
-                1,
-                std::memory_order_relaxed
-            );
+        id = 1;
     }
 
 
@@ -468,6 +569,9 @@ static uint16_t readU16(
 // ============================================================
 
 static bool readModbusTcpRaw(
+    ModbusTaskConnection &connection,
+    const std::string &host,
+    int port,
     int slave,
     int function,
     int address,
@@ -536,7 +640,13 @@ static bool readModbusTcpRaw(
     // 建立原始 TCP 通道
     // --------------------------------------------------------
 
-    if (!connectRawSocket())
+    if (
+        !connectRawSocket(
+            connection,
+            host,
+            port
+        )
+    )
     {
         return false;
     }
@@ -547,7 +657,9 @@ static bool readModbusTcpRaw(
     // --------------------------------------------------------
 
     const uint16_t transactionId =
-        nextTransactionId();
+        nextTransactionId(
+            connection
+        );
 
 
     // ========================================================
@@ -688,11 +800,22 @@ static bool readModbusTcpRaw(
     // ========================================================
 
     if (!sendAll(
-            g_rawSocket,
+            connection.socketFd,
             txFrame.data(),
             txFrame.size()))
     {
-        closeRawSocket();
+        if (connection.socketFd >= 0)
+        {
+            ::close(
+                connection.socketFd
+            );
+
+            connection.socketFd = -1;
+
+            connection.connectedHost.clear();
+
+            connection.connectedPort = -1;
+        }
 
         return false;
     }
@@ -713,12 +836,22 @@ static bool readModbusTcpRaw(
 
 
     if (!recvAll(
-            g_rawSocket,
+            connection.socketFd,
             header,
             sizeof(header)))
     {
-        closeRawSocket();
+        if (connection.socketFd >= 0)
+        {
+            ::close(
+                connection.socketFd
+            );
 
+            connection.socketFd = -1;
+
+            connection.connectedHost.clear();
+
+            connection.connectedPort = -1;
+        }
         return false;
     }
 
@@ -764,7 +897,18 @@ static bool readModbusTcpRaw(
             << responseTransactionId
             << std::endl;
 
-        closeRawSocket();
+        if (connection.socketFd >= 0)
+        {
+            ::close(
+                connection.socketFd
+            );
+
+            connection.socketFd = -1;
+
+            connection.connectedHost.clear();
+
+            connection.connectedPort = -1;
+        }
 
         return false;
     }
@@ -781,7 +925,18 @@ static bool readModbusTcpRaw(
             << protocolId
             << std::endl;
 
-        closeRawSocket();
+        if (connection.socketFd >= 0)
+        {
+            ::close(
+                connection.socketFd
+            );
+
+            connection.socketFd = -1;
+
+            connection.connectedHost.clear();
+
+            connection.connectedPort = -1;
+        }
 
         return false;
     }
@@ -801,7 +956,18 @@ static bool readModbusTcpRaw(
             << mbapLength
             << std::endl;
 
-        closeRawSocket();
+        if (connection.socketFd >= 0)
+        {
+            ::close(
+                connection.socketFd
+            );
+
+            connection.socketFd = -1;
+
+            connection.connectedHost.clear();
+
+            connection.connectedPort = -1;
+        }
 
         return false;
     }
@@ -828,11 +994,22 @@ static bool readModbusTcpRaw(
 
 
     if (!recvAll(
-            g_rawSocket,
+            connection.socketFd,
             remaining.data(),
             remaining.size()))
     {
-        closeRawSocket();
+        if (connection.socketFd >= 0)
+        {
+            ::close(
+                connection.socketFd
+            );
+
+            connection.socketFd = -1;
+
+            connection.connectedHost.clear();
+
+            connection.connectedPort = -1;
+        }
 
         return false;
     }
@@ -1157,10 +1334,38 @@ static bool readModbusTcpRaw(
 
 
 // ============================================================
+// 关闭指定任务自己的 Modbus TCP 连接
+//
+// 不会影响其他任务的 TCP Socket。
+// ============================================================
+
+void closeModbusTaskConnection(
+    ModbusTaskConnection &connection
+)
+{
+    if (connection.socketFd >= 0)
+    {
+        ::close(
+            connection.socketFd
+        );
+
+        connection.socketFd = -1;
+    }
+
+    connection.connectedHost.clear();
+
+    connection.connectedPort = -1;
+}
+
+// ============================================================
 // 对外的 Modbus 读取函数
 // ============================================================
 
-void readModbus(Point p)
+void readModbus(
+    ModbusTaskConnection &connection,
+    const ModbusTask &task,
+    const Point &p
+)
 {
     uint16_t reg[8] = {0};
 
@@ -1227,7 +1432,10 @@ void readModbus(Point p)
 
     const bool ok =
         readModbusTcpRaw(
-            p.slave,
+            connection,
+            task.host,
+            task.port,
+            task.slaveId,
             p.function,
             p.address,
             count,
@@ -1255,55 +1463,51 @@ void readModbus(Point p)
         getTime();
 
 
-    // ========================================================
-    // 保留原来的 telegram 格式
-    //
-    // 注意：
-    // 这里暂时仍然只保存摘要。
-    //
-    // 第一阶段真正原始报文已经存在：
-    //
-    // txFrame
-    // rxFrame
-    //
-    // 第二阶段再把它们写进共享内存。
-    // ========================================================
+// ============================================================
+// 生成真实 TX 报文
+// ============================================================
 
-    std::stringstream telegram;
+std::stringstream txTelegramStream;
 
-
-    telegram
+for (unsigned char byte : txFrame)
+{
+    txTelegramStream
+        << std::uppercase
         << std::hex
-        << std::setfill('0');
+        << std::setw(2)
+        << std::setfill('0')
+        << static_cast<int>(byte)
+        << " ";
+}
 
 
-    telegram
-        << "slave:"
-        << p.slave
-
-        << " function:"
-        << p.function
-
-        << " address:"
-        << p.address
-
-        << " data:";
+const std::string txTelegram =
+    txTelegramStream.str();
 
 
-    for (int i = 0; i < count; ++i)
-    {
-        telegram
-            << std::setw(4)
-            << reg[i]
-            << " ";
-    }
+// ============================================================
+// 生成真实 RX 报文
+// ============================================================
+
+std::stringstream rxTelegramStream;
+
+for (unsigned char byte : rxFrame)
+{
+    rxTelegramStream
+        << std::uppercase
+        << std::hex
+        << std::setw(2)
+        << std::setfill('0')
+        << static_cast<int>(byte)
+        << " ";
+}
 
 
-    const std::string packet =
-        telegram.str();
+const std::string rxTelegram =
+    rxTelegramStream.str();
 
 
-    // ============================================================
+// ============================================================
 // 使用 SystemManager 统一进行数据类型转换
 //
 // SystemManager 会根据：
@@ -1373,15 +1577,652 @@ catch (const std::exception& e)
     //
     // ========================================================
 
-    writeSharedMemory(
-        p.name,
-        p.slave,
-        p.function,
-        p.address,
-        p.datatype,
-        value,
-        timestamp,
-        packet,
-        1
-    );
+    // ============================================================
+
+// Direction is point configuration. Do not infer it from the read function
+// code: an OUTPUT holding-register point may still use FC03 for feedback.
+const std::string direction =
+    p.direction == "OUTPUT" ? "OUTPUT" : "INPUT";
+
+// ============================================================
+// 写入完整 Modbus 实时数据到共享内存
+// ============================================================
+
+writeSharedMemoryTelegram(
+    task.id,
+    p.id,
+    p.name,
+    task.slaveId,
+    p.function,
+    p.address,
+    p.datatype,
+    p.byteOrder,
+    direction,
+    value,
+    timestamp,
+    txTelegram,
+    rxTelegram,
+    1
+);
+}
+// ============================================================
+// 强制写入 Modbus 数据
+//
+// UINT16 / INT16:
+//     FC06
+//
+// UINT32 / INT32 / FLOAT:
+//     FC16，2 registers
+//
+// DOUBLE:
+//     FC16，4 registers
+// ============================================================
+
+bool writeModbus(
+    const ModbusTask &task,
+    const Point &point,
+    double value,
+    std::string &error
+)
+{
+    error.clear();
+
+
+    // ========================================================
+    // 1. 参数检查
+    // ========================================================
+
+    if (
+        task.slaveId < 0 ||
+        task.slaveId > 255
+    )
+    {
+        error = "非法 Unit ID";
+        return false;
+    }
+
+
+    if (
+        point.address < 0 ||
+        point.address > 0xFFFF
+    )
+    {
+        error = "非法 Modbus 地址";
+        return false;
+    }
+
+
+    const int count =
+        SystemManager::getRegisterCount(
+            point.datatype
+        );
+
+
+    if (
+        count != 1 &&
+        count != 2 &&
+        count != 4
+    )
+    {
+        error =
+            "不支持的数据类型: " +
+            point.datatype;
+
+        return false;
+    }
+
+
+    if (
+        point.byteOrder != "ABCD" &&
+        point.byteOrder != "BADC" &&
+        point.byteOrder != "CDAB" &&
+        point.byteOrder != "DCBA"
+    )
+    {
+        error =
+            "不支持的字节序: " +
+            point.byteOrder;
+
+        return false;
+    }
+
+
+    // ========================================================
+    // 2. 将 value 转换成“标准顺序”的原始字节
+    //
+    // logicalBytes:
+    //
+    // 32 bit:
+    //     A B C D
+    //
+    // 64 bit:
+    //     A B C D E F G H
+    // ========================================================
+
+    uint8_t logicalBytes[8] = {0};
+
+
+    if (point.datatype == "UINT16")
+    {
+        if (
+            value < 0.0 ||
+            value > 65535.0 ||
+            std::trunc(value) != value
+        )
+        {
+            error = "UINT16 必须是 0~65535 范围内的整数";
+            return false;
+        }
+
+
+        const uint16_t raw =
+            static_cast<uint16_t>(value);
+
+
+        logicalBytes[0] =
+            static_cast<uint8_t>(
+                (raw >> 8) & 0xFF
+            );
+
+        logicalBytes[1] =
+            static_cast<uint8_t>(
+                raw & 0xFF
+            );
+    }
+    else if (point.datatype == "INT16")
+    {
+        if (
+            value < -32768.0 ||
+            value > 32767.0 ||
+            std::trunc(value) != value
+        )
+        {
+            error = "INT16 必须是 -32768~32767 范围内的整数";
+            return false;
+        }
+
+
+        const int16_t signedValue =
+            static_cast<int16_t>(value);
+
+        uint16_t raw = 0;
+
+
+        std::memcpy(
+            &raw,
+            &signedValue,
+            sizeof(raw)
+        );
+
+
+        logicalBytes[0] =
+            static_cast<uint8_t>(
+                (raw >> 8) & 0xFF
+            );
+
+        logicalBytes[1] =
+            static_cast<uint8_t>(
+                raw & 0xFF
+            );
+    }
+    else if (point.datatype == "UINT32")
+    {
+        if (
+            value < 0.0 ||
+            value > 4294967295.0 ||
+            std::trunc(value) != value
+        )
+        {
+            error = "UINT32 必须是 0~4294967295 范围内的整数";
+            return false;
+        }
+
+
+        const uint32_t raw =
+            static_cast<uint32_t>(value);
+
+
+        logicalBytes[0] =
+            static_cast<uint8_t>(
+                (raw >> 24) & 0xFF
+            );
+
+        logicalBytes[1] =
+            static_cast<uint8_t>(
+                (raw >> 16) & 0xFF
+            );
+
+        logicalBytes[2] =
+            static_cast<uint8_t>(
+                (raw >> 8) & 0xFF
+            );
+
+        logicalBytes[3] =
+            static_cast<uint8_t>(
+                raw & 0xFF
+            );
+    }
+    else if (point.datatype == "INT32")
+    {
+        if (
+            value < -2147483648.0 ||
+            value > 2147483647.0 ||
+            std::trunc(value) != value
+        )
+        {
+            error = "INT32 必须是 -2147483648~2147483647 范围内的整数";
+            return false;
+        }
+
+
+        const int32_t signedValue =
+            static_cast<int32_t>(value);
+
+        uint32_t raw = 0;
+
+
+        std::memcpy(
+            &raw,
+            &signedValue,
+            sizeof(raw)
+        );
+
+
+        logicalBytes[0] =
+            static_cast<uint8_t>(
+                (raw >> 24) & 0xFF
+            );
+
+        logicalBytes[1] =
+            static_cast<uint8_t>(
+                (raw >> 16) & 0xFF
+            );
+
+        logicalBytes[2] =
+            static_cast<uint8_t>(
+                (raw >> 8) & 0xFF
+            );
+
+        logicalBytes[3] =
+            static_cast<uint8_t>(
+                raw & 0xFF
+            );
+    }
+    else if (point.datatype == "FLOAT")
+    {
+        if (value < -static_cast<double>(std::numeric_limits<float>::max()) ||
+            value > static_cast<double>(std::numeric_limits<float>::max()))
+        {
+            error = "FLOAT 值超出 32 位浮点数范围";
+            return false;
+        }
+
+        const float floatValue =
+            static_cast<float>(value);
+
+        uint32_t raw = 0;
+
+
+        std::memcpy(
+            &raw,
+            &floatValue,
+            sizeof(raw)
+        );
+
+
+        logicalBytes[0] =
+            static_cast<uint8_t>(
+                (raw >> 24) & 0xFF
+            );
+
+        logicalBytes[1] =
+            static_cast<uint8_t>(
+                (raw >> 16) & 0xFF
+            );
+
+        logicalBytes[2] =
+            static_cast<uint8_t>(
+                (raw >> 8) & 0xFF
+            );
+
+        logicalBytes[3] =
+            static_cast<uint8_t>(
+                raw & 0xFF
+            );
+    }
+    else if (point.datatype == "DOUBLE")
+    {
+        uint64_t raw = 0;
+
+
+        std::memcpy(
+            &raw,
+            &value,
+            sizeof(raw)
+        );
+
+
+        for (
+            int i = 0;
+            i < 8;
+            ++i
+        )
+        {
+            logicalBytes[i] =
+                static_cast<uint8_t>(
+                    (raw >> (56 - i * 8)) &
+                    0xFF
+                );
+        }
+    }
+    else
+    {
+        error =
+            "不支持的数据类型: " +
+            point.datatype;
+
+        return false;
+    }
+
+
+    // ========================================================
+    // 3. 根据 byteOrder 做 SystemManager::convert()
+    //    的逆变换
+    //
+    // wireBytes 就是真正写入 Modbus Register 的字节
+    // ========================================================
+
+    uint8_t wireBytes[8] = {0};
+
+
+    if (count == 1)
+    {
+        if (point.byteOrder == "BADC" || point.byteOrder == "DCBA")
+        {
+            wireBytes[0] = logicalBytes[1];
+            wireBytes[1] = logicalBytes[0];
+        }
+        else
+        {
+            wireBytes[0] = logicalBytes[0];
+            wireBytes[1] = logicalBytes[1];
+        }
+    }
+    else if (count == 2)
+    {
+        if (point.byteOrder == "ABCD")
+        {
+            wireBytes[0] = logicalBytes[0];
+            wireBytes[1] = logicalBytes[1];
+            wireBytes[2] = logicalBytes[2];
+            wireBytes[3] = logicalBytes[3];
+        }
+        else if (point.byteOrder == "BADC")
+        {
+            wireBytes[0] = logicalBytes[1];
+            wireBytes[1] = logicalBytes[0];
+            wireBytes[2] = logicalBytes[3];
+            wireBytes[3] = logicalBytes[2];
+        }
+        else if (point.byteOrder == "CDAB")
+        {
+            wireBytes[0] = logicalBytes[2];
+            wireBytes[1] = logicalBytes[3];
+            wireBytes[2] = logicalBytes[0];
+            wireBytes[3] = logicalBytes[1];
+        }
+        else // DCBA
+        {
+            wireBytes[0] = logicalBytes[3];
+            wireBytes[1] = logicalBytes[2];
+            wireBytes[2] = logicalBytes[1];
+            wireBytes[3] = logicalBytes[0];
+        }
+    }
+    else
+    {
+        // DOUBLE：8 bytes
+
+        if (point.byteOrder == "ABCD")
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                wireBytes[i] =
+                    logicalBytes[i];
+            }
+        }
+        else if (point.byteOrder == "BADC")
+        {
+            for (int i = 0; i < 8; i += 2)
+            {
+                wireBytes[i] =
+                    logicalBytes[i + 1];
+
+                wireBytes[i + 1] =
+                    logicalBytes[i];
+            }
+        }
+        else if (point.byteOrder == "CDAB")
+        {
+            wireBytes[0] = logicalBytes[2];
+            wireBytes[1] = logicalBytes[3];
+            wireBytes[2] = logicalBytes[0];
+            wireBytes[3] = logicalBytes[1];
+
+            wireBytes[4] = logicalBytes[6];
+            wireBytes[5] = logicalBytes[7];
+            wireBytes[6] = logicalBytes[4];
+            wireBytes[7] = logicalBytes[5];
+        }
+        else // DCBA
+        {
+            for (int i = 0; i < 8; ++i)
+            {
+                wireBytes[i] =
+                    logicalBytes[7 - i];
+            }
+        }
+    }
+
+
+    // ========================================================
+    // 4. 组装寄存器
+    // ========================================================
+
+    uint16_t registers[4] = {0};
+
+
+    for (
+        int i = 0;
+        i < count;
+        ++i
+    )
+    {
+        registers[i] =
+            static_cast<uint16_t>(
+                (
+                    static_cast<uint16_t>(
+                        wireBytes[i * 2]
+                    ) << 8
+                )
+                |
+                static_cast<uint16_t>(
+                    wireBytes[i * 2 + 1]
+                )
+            );
+    }
+
+    // 真实写入统一使用 SystemManager 的公共编码器，
+    // 确保发送与接收的数据类型和字节序完全对称。
+    try
+    {
+        const auto encoded = SystemManager::encode(
+            value, point.datatype, point.byteOrder);
+        for (int i = 0; i < count; ++i)
+            registers[i] = encoded[static_cast<std::size_t>(i)];
+    }
+    catch (const std::exception &exception)
+    {
+        error = exception.what();
+        return false;
+    }
+
+
+    // ========================================================
+    // 5. 使用 libmodbus 执行真正写入
+    //
+    // 这里重新建立一个独立写连接，
+    // 避免和现有 raw polling socket 相互干扰。
+    // ========================================================
+
+    modbus_t *ctx =
+        modbus_new_tcp(
+            task.host.c_str(),
+            task.port
+        );
+
+
+    if (ctx == nullptr)
+    {
+        error =
+            "modbus_new_tcp 创建失败";
+
+        return false;
+    }
+
+
+    if (
+        modbus_set_slave(
+            ctx,
+            task.slaveId
+        ) == -1
+    )
+    {
+        error =
+            std::string(
+                "设置 Slave ID 失败: "
+            ) +
+            modbus_strerror(errno);
+
+        modbus_free(ctx);
+
+        return false;
+    }
+
+    const std::uint32_t timeoutSeconds =
+        static_cast<std::uint32_t>(task.timeout / 1000);
+    const std::uint32_t timeoutMicroseconds =
+        static_cast<std::uint32_t>((task.timeout % 1000) * 1000);
+    modbus_set_response_timeout(
+        ctx,
+        timeoutSeconds,
+        timeoutMicroseconds);
+
+
+    if (
+        modbus_connect(ctx) == -1
+    )
+    {
+        error =
+            std::string(
+                "连接 Modbus 设备失败: "
+            ) +
+            modbus_strerror(errno);
+
+        modbus_free(ctx);
+
+        return false;
+    }
+
+
+    // ========================================================
+    // 6. 真正写寄存器
+    // ========================================================
+
+    int rc = -1;
+
+
+    if (count == 1)
+    {
+        // FC06 Write Single Register
+        rc =
+            modbus_write_register(
+                ctx,
+                point.address,
+                registers[0]
+            );
+
+
+        if (rc != 1)
+        {
+            error =
+                std::string(
+                    "FC06 写入失败: "
+                ) +
+                modbus_strerror(errno);
+        }
+    }
+    else
+    {
+        // FC16 Write Multiple Registers
+        rc =
+            modbus_write_registers(
+                ctx,
+                point.address,
+                count,
+                registers
+            );
+
+
+        if (rc != count)
+        {
+            error =
+                std::string(
+                    "FC16 写入失败: "
+                ) +
+                modbus_strerror(errno);
+        }
+    }
+
+
+    // ========================================================
+    // 7. 关闭写连接
+    // ========================================================
+
+    modbus_close(ctx);
+    modbus_free(ctx);
+
+
+    if (rc < 0)
+    {
+        return false;
+    }
+
+
+    if (
+        (count == 1 && rc != 1) ||
+        (count > 1 && rc != count)
+    )
+    {
+        return false;
+    }
+
+
+    // ========================================================
+    // 8. Debug
+    // ========================================================
+
+    std::cout
+        << "[MODBUS WRITE] 成功"
+        << " name=" << point.name
+        << " slave=" << task.slaveId
+        << " address=" << point.address
+        << " datatype=" << point.datatype
+        << " byteOrder=" << point.byteOrder
+        << " value=" << value
+        << " count=" << count
+        << std::endl;
+
+
+    return true;
 }

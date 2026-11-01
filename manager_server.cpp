@@ -977,17 +977,35 @@ std::string ManagerServer::handleRequest(
     switch (messageType)
     {
     case MSG_PING:
-        return handlePing(payload);
+        return handlePing(
+            payload
+        );
+
 
     case MSG_SNAPSHOT:
         return handleSnapshot();
 
+
     case MSG_FORCE_VALUE:
-        return handleForceValue(payload);
+        return handleForceValue(
+            payload
+        );
+
 
     default:
-        return
-            R"({"ok":false,"error":"unknown_message_type"})";
+    {
+        std::ostringstream oss;
+
+        oss
+            << "{"
+            << "\"ok\":false,"
+            << "\"error\":\"unknown_message_type\","
+            << "\"messageType\":"
+            << messageType
+            << "}";
+
+        return oss.str();
+    }
     }
 }
 
@@ -1286,15 +1304,10 @@ std::string ManagerServer::handleSnapshot()
             i + 1;
 
 
-        std::string direction =
-            "INPUT";
-
-
-        // 当前 ModbusCollector 是采集程序，
-        // 因此这些点默认作为 INPUT。
-        //
-        // 后续如果增加写寄存器功能，
-        // 再根据数据库配置区分 OUTPUT / BIDIRECTIONAL。
+        const std::string direction =
+            variable.direction[0] != '\0'
+                ? variable.direction
+                : "INPUT";
 
 
         std::string status =
@@ -1312,6 +1325,11 @@ std::string ManagerServer::handleSnapshot()
         json
             << "{"
 
+            // ====================================================
+            // 旧兼容 ID
+            // 暂时保留，避免影响 Qt 现有代码
+            // ====================================================
+
             << "\"id\":"
             << pointId
             << ","
@@ -1319,6 +1337,24 @@ std::string ManagerServer::handleSnapshot()
             << "\"systemPointId\":"
             << pointId
             << ","
+
+
+            // ====================================================
+            // 多 Modbus 任务真实身份
+            // ====================================================
+
+            << "\"taskId\":"
+            << variable.taskId
+            << ","
+
+            << "\"pointId\":"
+            << variable.pointId
+            << ","
+
+
+            // ====================================================
+            // name
+            // ====================================================
 
             << "\"name\":\""
             << jsonEscape(

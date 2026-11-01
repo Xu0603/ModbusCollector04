@@ -58,7 +58,7 @@ private:
         uint16_t messageType,
         const std::string& payload
     );
-
+    
     std::string handlePing(
         const std::string& payload
     );

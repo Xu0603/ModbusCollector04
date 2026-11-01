@@ -37,6 +37,9 @@ int main()
 
         for(int i = 0; i < ptr->count; i++)
         {
+            std::cout << "任务ID:" << ptr->vars[i].taskId << std::endl;
+            std::cout << "点ID:" << ptr->vars[i].pointId << std::endl;
+
             std::cout
                 << "变量名:"
                 << ptr->vars[i].name
@@ -64,6 +67,16 @@ int main()
             std::cout
                 << "数据类型:"
                 << ptr->vars[i].datatype
+                << std::endl;
+
+            std::cout
+                << "大小端:"
+                << ptr->vars[i].byteOrder
+                << std::endl;
+
+            std::cout
+                << "读写方向:"
+                << ptr->vars[i].direction
                 << std::endl;
 
 

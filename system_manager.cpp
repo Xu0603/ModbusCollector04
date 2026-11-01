@@ -4,6 +4,8 @@
 #include <iostream>
 #include <iomanip>
 #include <stdexcept>
+#include <cmath>
+#include <limits>
 
 
 // ============================================================
@@ -292,6 +294,7 @@ for (int i = 0; i < count; ++i)
         << std::dec
         << std::endl;
 }
+
     // --------------------------------------------------------
     // 检查数据类型需要的寄存器数量
     // --------------------------------------------------------
@@ -334,8 +337,12 @@ for (int i = 0; i < count; ++i)
 
     if (datatype == "INT16")
     {
+        uint16_t raw = reg[0];
+        if (byteOrder == "BADC" || byteOrder == "DCBA")
+            raw = static_cast<uint16_t>((raw >> 8) | (raw << 8));
+
         int16_t value =
-            static_cast<int16_t>(reg[0]);
+            static_cast<int16_t>(raw);
 
         return static_cast<double>(value);
     }
@@ -347,8 +354,9 @@ for (int i = 0; i < count; ++i)
 
     if (datatype == "UINT16")
     {
-        uint16_t value =
-            reg[0];
+        uint16_t value = reg[0];
+        if (byteOrder == "BADC" || byteOrder == "DCBA")
+            value = static_cast<uint16_t>((value >> 8) | (value << 8));
 
         return static_cast<double>(value);
     }
@@ -487,4 +495,71 @@ for (int i = 0; i < count; ++i)
     throw std::runtime_error(
         "无法转换的数据类型: " + datatype
     );
+}
+
+std::vector<std::uint16_t> SystemManager::encode(
+    double value, const std::string& datatype, const std::string& byteOrder)
+{
+    const int count = getRegisterCount(datatype);
+    if (count == 0) throw std::runtime_error("未知的数据类型: " + datatype);
+    if (!isValidByteOrder(byteOrder)) throw std::runtime_error("未知的字节序: " + byteOrder);
+    if (!std::isfinite(value)) throw std::runtime_error("写入值必须是有限数");
+
+    std::uint64_t raw = 0;
+    if (datatype == "UINT16") {
+        if (value < 0 || value > 65535 || std::trunc(value) != value)
+            throw std::runtime_error("UINT16 必须是 0~65535 范围内的整数");
+        raw = static_cast<std::uint16_t>(value);
+    } else if (datatype == "INT16") {
+        if (value < -32768 || value > 32767 || std::trunc(value) != value)
+            throw std::runtime_error("INT16 必须是 -32768~32767 范围内的整数");
+        const auto v = static_cast<std::int16_t>(value);
+        std::uint16_t bits{}; std::memcpy(&bits, &v, sizeof(bits)); raw = bits;
+    } else if (datatype == "UINT32") {
+        if (value < 0 || value > 4294967295.0 || std::trunc(value) != value)
+            throw std::runtime_error("UINT32 必须是 0~4294967295 范围内的整数");
+        raw = static_cast<std::uint32_t>(value);
+    } else if (datatype == "INT32") {
+        if (value < -2147483648.0 || value > 2147483647.0 || std::trunc(value) != value)
+            throw std::runtime_error("INT32 必须是 32 位有符号整数");
+        const auto v = static_cast<std::int32_t>(value);
+        std::uint32_t bits{}; std::memcpy(&bits, &v, sizeof(bits)); raw = bits;
+    } else if (datatype == "FLOAT") {
+        if (value < -static_cast<double>(std::numeric_limits<float>::max()) ||
+            value > static_cast<double>(std::numeric_limits<float>::max()))
+            throw std::runtime_error("FLOAT 值超出 32 位浮点数范围");
+        const float v = static_cast<float>(value);
+        std::uint32_t bits{}; std::memcpy(&bits, &v, sizeof(bits)); raw = bits;
+    } else {
+        std::memcpy(&raw, &value, sizeof(raw));
+    }
+
+    const int byteCount = count * 2;
+    std::uint8_t logical[8]{}, wire[8]{};
+    for (int i = 0; i < byteCount; ++i)
+        logical[i] = static_cast<std::uint8_t>(raw >> ((byteCount - 1 - i) * 8));
+
+    if (byteCount == 2) {
+        if (byteOrder == "BADC" || byteOrder == "DCBA") {
+            wire[0] = logical[1]; wire[1] = logical[0];
+        } else { wire[0] = logical[0]; wire[1] = logical[1]; }
+    } else if (byteOrder == "ABCD") {
+        std::memcpy(wire, logical, byteCount);
+    } else if (byteOrder == "BADC") {
+        for (int i = 0; i < byteCount; i += 2) {
+            wire[i] = logical[i + 1]; wire[i + 1] = logical[i];
+        }
+    } else if (byteOrder == "CDAB") {
+        for (int i = 0; i < byteCount; i += 4) {
+            wire[i]=logical[i+2]; wire[i+1]=logical[i+3];
+            wire[i+2]=logical[i]; wire[i+3]=logical[i+1];
+        }
+    } else {
+        for (int i = 0; i < byteCount; ++i) wire[i] = logical[byteCount - 1 - i];
+    }
+
+    std::vector<std::uint16_t> registers(count);
+    for (int i = 0; i < count; ++i)
+        registers[i] = static_cast<std::uint16_t>((wire[i*2] << 8) | wire[i*2+1]);
+    return registers;
 }

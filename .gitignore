@@ -11,6 +11,7 @@ build/
 
 # 备份文件
 *.bak
+*_before_*.db
 
 # 日志文件
 *.log

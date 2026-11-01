@@ -29,6 +29,14 @@ public:
         const std::string& byteOrder
     );
 
+    // 将逻辑值编码为可直接写入 Modbus 的寄存器。
+    // 与 convert() 互为逆操作。
+    static std::vector<std::uint16_t> encode(
+        double value,
+        const std::string& datatype,
+        const std::string& byteOrder
+    );
+
 
 private:
 
