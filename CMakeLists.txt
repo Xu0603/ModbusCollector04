@@ -68,6 +68,17 @@ add_executable(
     system_manager.cpp
 )
 
+add_executable(
+    test_rtu_client
+    test_rtu_client.cpp
+    modbus_client.cpp
+    shared_memory.cpp
+    system_manager.cpp
+    time_utils.cpp
+)
+
+target_link_libraries(test_rtu_client ${MODBUS_LIB} pthread util rt)
+
 
 # ============================================================
 # system-managerd

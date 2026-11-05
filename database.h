@@ -69,6 +69,14 @@ struct ModbusTask
 
     int port = 502;
 
+    // TCP / RTU。旧数据库自动按 TCP 处理。
+    std::string transport = "TCP";
+    std::string serialPort = "/dev/ttyS0";
+    int baudRate = 9600;
+    char parity = 'N';
+    int dataBits = 8;
+    int stopBits = 1;
+
     int slaveId = 1;
 
     int period = 1000;

@@ -3,6 +3,7 @@
 #include "shared_memory.h"
 #include "modbus_client.h"
 #include "database.h"
+#include "time_utils.h"
 
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -1191,6 +1192,13 @@ std::string ModbusServer::handleSnapshot()
             << task.port
             << ","
 
+            << "\"transport\":\"" << jsonEscape(task.transport) << "\","
+            << "\"serialPort\":\"" << jsonEscape(task.serialPort) << "\","
+            << "\"baudRate\":" << task.baudRate << ","
+            << "\"parity\":\"" << task.parity << "\","
+            << "\"dataBits\":" << task.dataBits << ","
+            << "\"stopBits\":" << task.stopBits << ","
+
             << "\"slaveId\":"
             << task.slaveId
             << ","
@@ -2130,14 +2138,34 @@ std::string ModbusServer::handleForceValue(
 
     bool ok = false;
     std::string writeError;
+    std::string writeTxTelegram;
+    std::string writeRxTelegram;
+    std::string writeTimestamp;
 
     if (physicalOutput)
     {
-        ok = writeModbus(task, point, value, writeError);
+        ok = writeModbus(task, point, value, writeError,
+                         writeTxTelegram, writeRxTelegram);
         if (ok)
         {
-            // OUTPUT 显示下一轮 FC03 回读值，不伪造强制值。
+            writeTimestamp = getTime();
             releaseSharedMemoryValue(task.id, point.id);
+            writeSharedMemoryTelegram(
+                task.id,
+                point.id,
+                point.name,
+                task.slaveId,
+                point.function,
+                point.address,
+                point.datatype,
+                point.byteOrder,
+                "OUTPUT",
+                value,
+                writeTimestamp,
+                writeTxTelegram,
+                writeRxTelegram,
+                1
+            );
         }
     }
     else
@@ -2194,6 +2222,14 @@ std::string ModbusServer::handleForceValue(
         << ","
         << "\"physicalWrite\":"
         << (physicalOutput ? "true" : "false")
+        << ",\"transport\":\"" << jsonEscape(task.transport) << "\""
+        << ",\"timestamp\":\""
+        << jsonEscape(writeTimestamp.empty() ? getTime() : writeTimestamp)
+        << "\",\"txTelegram\":\""
+        << jsonEscape(writeTxTelegram)
+        << "\",\"rxTelegram\":\""
+        << jsonEscape(writeRxTelegram)
+        << "\""
         << ","
         << "\"message\":\""
         << (physicalOutput ? "Modbus 设备写入成功" : "共享内存逻辑点强制成功")

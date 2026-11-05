@@ -204,6 +204,17 @@ bool releaseSharedMemoryValue(
     int pointId
 );
 
+bool ensureSharedMemoryOutputPoint(
+    int taskId,
+    int pointId,
+    const std::string &name,
+    int slave,
+    int function,
+    int address,
+    const std::string &datatype,
+    const std::string &byteOrder
+);
+
 // ============================================================
 // 根据当前有效配置同步共享内存变量
 //

@@ -4,6 +4,9 @@
 
 #include <string>
 
+struct _modbus;
+typedef struct _modbus modbus_t;
+
 
 // ============================================================
 // 每个 Modbus 任务独立拥有一个 TCP 连接上下文
@@ -30,6 +33,13 @@ struct ModbusTaskConnection
     // 一个 connection 只由一个 Worker 线程访问，
     // 因此这里不需要 atomic。
     unsigned short transactionId = 1;
+
+    modbus_t *rtuContext = nullptr;
+    std::string connectedSerialPort;
+    int connectedBaudRate = 0;
+    char connectedParity = 'N';
+    int connectedDataBits = 0;
+    int connectedStopBits = 0;
 };
 
 
@@ -77,5 +87,7 @@ bool writeModbus(
     const ModbusTask &task,
     const Point &point,
     double value,
-    std::string &error
+    std::string &error,
+    std::string &txTelegram,
+    std::string &rxTelegram
 );

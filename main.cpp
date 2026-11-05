@@ -206,6 +206,12 @@ static bool sameModbusConfig(
             left.name != right.name ||
             left.host != right.host ||
             left.port != right.port ||
+            left.transport != right.transport ||
+            left.serialPort != right.serialPort ||
+            left.baudRate != right.baudRate ||
+            left.parity != right.parity ||
+            left.dataBits != right.dataBits ||
+            left.stopBits != right.stopBits ||
             left.slaveId != right.slaveId ||
             left.period != right.period ||
             left.timeout != right.timeout ||
@@ -295,9 +301,10 @@ static void printTaskConfig(
 
         std::cout
             << "设备    : "
-            << task.host
-            << ":"
-            << task.port
+            << (task.transport == "RTU"
+                ? task.serialPort + " " + std::to_string(task.baudRate) + " " + task.parity +
+                  std::to_string(task.dataBits) + std::to_string(task.stopBits)
+                : task.host + ":" + std::to_string(task.port))
             << std::endl;
 
         std::cout
@@ -409,6 +416,21 @@ static void executeTask(
         task.points
     )
     {
+        if (point.direction == "OUTPUT")
+        {
+            ensureSharedMemoryOutputPoint(
+                task.id,
+                point.id,
+                point.name,
+                task.slaveId,
+                point.function,
+                point.address,
+                point.datatype,
+                point.byteOrder
+            );
+            continue;
+        }
+
         readModbus(
             connection,
             task,

@@ -736,6 +736,16 @@ void writeSharedMemoryTelegram(
                 sizeof(variable.byteOrder) - 1
             ] = '\0';
 
+            strncpy(
+                variable.direction,
+                direction.c_str(),
+                sizeof(variable.direction) - 1
+            );
+
+            variable.direction[
+                sizeof(variable.direction) - 1
+            ] = '\0';
+
 
             // ========================================================
             // value
@@ -841,6 +851,59 @@ void writeSharedMemoryTelegram(
         data,
         sizeof(SharedData)
     );
+}
+
+bool ensureSharedMemoryOutputPoint(
+    int taskId,
+    int pointId,
+    const std::string &name,
+    int slave,
+    int function,
+    int address,
+    const std::string &datatype,
+    const std::string &byteOrder
+)
+{
+    SharedData *data = openSharedMemory();
+    if (!data)
+        return false;
+
+    pthread_mutex_lock(&data->mutex);
+
+    Variable *variable = nullptr;
+    for (int i = 0; i < data->count; ++i) {
+        if (data->vars[i].taskId == taskId && data->vars[i].pointId == pointId) {
+            variable = &data->vars[i];
+            break;
+        }
+    }
+
+    if (!variable && data->count < MAX_VARIABLES) {
+        variable = &data->vars[data->count++];
+        std::memset(variable, 0, sizeof(Variable));
+        variable->taskId = taskId;
+        variable->pointId = pointId;
+    }
+
+    if (variable) {
+        variable->slave = slave;
+        variable->function = function;
+        variable->address = address;
+        strncpy(variable->name, name.c_str(), sizeof(variable->name) - 1);
+        strncpy(variable->datatype, datatype.c_str(), sizeof(variable->datatype) - 1);
+        strncpy(variable->byteOrder, byteOrder.c_str(), sizeof(variable->byteOrder) - 1);
+        strncpy(variable->direction, "OUTPUT", sizeof(variable->direction) - 1);
+        variable->name[sizeof(variable->name) - 1] = '\0';
+        variable->datatype[sizeof(variable->datatype) - 1] = '\0';
+        variable->byteOrder[sizeof(variable->byteOrder) - 1] = '\0';
+        variable->direction[sizeof(variable->direction) - 1] = '\0';
+        variable->forced = 0;
+        variable->forcedValue = 0.0;
+    }
+
+    pthread_mutex_unlock(&data->mutex);
+    munmap(data, sizeof(SharedData));
+    return variable != nullptr;
 }
 
 // ============================================================

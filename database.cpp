@@ -286,6 +286,14 @@ loadModbusTasks(
         return tasks;
     }
 
+    // 向后兼容：已有 TCP 数据库首次启动时自动补齐 RTU 配置列。
+    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN transport TEXT NOT NULL DEFAULT 'TCP';", nullptr, nullptr, nullptr);
+    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN serial_port TEXT NOT NULL DEFAULT '/dev/ttyS0';", nullptr, nullptr, nullptr);
+    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN baud_rate INTEGER NOT NULL DEFAULT 9600;", nullptr, nullptr, nullptr);
+    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN parity TEXT NOT NULL DEFAULT 'N';", nullptr, nullptr, nullptr);
+    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN data_bits INTEGER NOT NULL DEFAULT 8;", nullptr, nullptr, nullptr);
+    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN stop_bits INTEGER NOT NULL DEFAULT 1;", nullptr, nullptr, nullptr);
+
 
     // ========================================================
     // 2. 加载所有启用的 Modbus 任务
@@ -302,7 +310,7 @@ loadModbusTasks(
         "timeout, "
         "retry_count, "
         "reconnect_interval, "
-        "enable "
+        "enable, transport, serial_port, baud_rate, parity, data_bits, stop_bits "
         "FROM modbus_tasks "
         "WHERE enable = 1 "
         "ORDER BY id;";
@@ -406,6 +414,14 @@ loadModbusTasks(
             )
             !=
             0;
+
+        task.transport = columnText(taskStmt, 10);
+        task.serialPort = columnText(taskStmt, 11);
+        task.baudRate = sqlite3_column_int(taskStmt, 12);
+        const std::string parity = columnText(taskStmt, 13);
+        task.parity = parity.empty() ? 'N' : parity.front();
+        task.dataBits = sqlite3_column_int(taskStmt, 14);
+        task.stopBits = sqlite3_column_int(taskStmt, 15);
 
 
         tasks.push_back(
@@ -648,6 +664,14 @@ bool loadModbusTaskPoint(
     }
 
 
+    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN transport TEXT NOT NULL DEFAULT 'TCP';", nullptr, nullptr, nullptr);
+    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN serial_port TEXT NOT NULL DEFAULT '/dev/ttyS0';", nullptr, nullptr, nullptr);
+    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN baud_rate INTEGER NOT NULL DEFAULT 9600;", nullptr, nullptr, nullptr);
+    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN parity TEXT NOT NULL DEFAULT 'N';", nullptr, nullptr, nullptr);
+    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN data_bits INTEGER NOT NULL DEFAULT 8;", nullptr, nullptr, nullptr);
+    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN stop_bits INTEGER NOT NULL DEFAULT 1;", nullptr, nullptr, nullptr);
+
+
     // ========================================================
     // 1. 查任务
     // ========================================================
@@ -663,7 +687,7 @@ bool loadModbusTaskPoint(
         "timeout, "
         "retry_count, "
         "reconnect_interval, "
-        "enable "
+        "enable, transport, serial_port, baud_rate, parity, data_bits, stop_bits "
         "FROM modbus_tasks "
         "WHERE id = ?;";
 
@@ -774,6 +798,14 @@ bool loadModbusTaskPoint(
         )
         !=
         0;
+
+    task.transport = columnText(taskStmt, 10);
+    task.serialPort = columnText(taskStmt, 11);
+    task.baudRate = sqlite3_column_int(taskStmt, 12);
+    const std::string taskParity = columnText(taskStmt, 13);
+    task.parity = taskParity.empty() ? 'N' : taskParity.front();
+    task.dataBits = sqlite3_column_int(taskStmt, 14);
+    task.stopBits = sqlite3_column_int(taskStmt, 15);
 
 
     sqlite3_finalize(

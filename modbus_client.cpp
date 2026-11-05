@@ -13,6 +13,9 @@
 #include <string>
 #include <cmath>
 #include <limits>
+#include <map>
+#include <memory>
+#include <mutex>
 
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -561,6 +564,108 @@ static uint16_t readU16(
         (static_cast<uint16_t>(data[0]) << 8) |
         static_cast<uint16_t>(data[1])
     );
+}
+
+static uint16_t modbusCrc16(const uint8_t *data, size_t length)
+{
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < length; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc & 1) ? static_cast<uint16_t>((crc >> 1) ^ 0xA001) : static_cast<uint16_t>(crc >> 1);
+    }
+    return crc;
+}
+
+static bool connectRtu(ModbusTaskConnection &connection, const ModbusTask &task, std::string &error)
+{
+    if (connection.rtuContext && connection.connectedSerialPort == task.serialPort &&
+        connection.connectedBaudRate == task.baudRate && connection.connectedParity == task.parity &&
+        connection.connectedDataBits == task.dataBits && connection.connectedStopBits == task.stopBits) {
+        modbus_set_slave(connection.rtuContext, task.slaveId);
+        return true;
+    }
+    if (connection.rtuContext) {
+        modbus_close(connection.rtuContext);
+        modbus_free(connection.rtuContext);
+        connection.rtuContext = nullptr;
+    }
+    connection.rtuContext = modbus_new_rtu(task.serialPort.c_str(), task.baudRate, task.parity,
+                                            task.dataBits, task.stopBits);
+    if (!connection.rtuContext) { error = "无法创建 RTU 串口上下文"; return false; }
+    modbus_set_slave(connection.rtuContext, task.slaveId);
+    modbus_set_response_timeout(connection.rtuContext,
+        static_cast<uint32_t>(task.timeout / 1000), static_cast<uint32_t>((task.timeout % 1000) * 1000));
+    if (modbus_connect(connection.rtuContext) == -1) {
+        error = std::string("打开串口失败: ") + modbus_strerror(errno);
+        modbus_free(connection.rtuContext);
+        connection.rtuContext = nullptr;
+        return false;
+    }
+    connection.connectedSerialPort = task.serialPort;
+    connection.connectedBaudRate = task.baudRate;
+    connection.connectedParity = task.parity;
+    connection.connectedDataBits = task.dataBits;
+    connection.connectedStopBits = task.stopBits;
+    return true;
+}
+
+static bool transactRtu(ModbusTaskConnection &connection, const ModbusTask &task, uint8_t function,
+                        int address, int count, const uint16_t *writeRegisters, uint16_t *readRegisters,
+                        std::vector<uint8_t> &txFrame, std::vector<uint8_t> &rxFrame, std::string &error)
+{
+    // RTU 是单主请求/响应总线。同一串口上的周期采集与人工 OUTPUT
+    // 必须互斥，避免响应被另一个线程或文件描述符读走。
+    static std::mutex serialLocksGuard;
+    static std::map<std::string, std::shared_ptr<std::mutex>> serialLocks;
+    std::shared_ptr<std::mutex> serialLock;
+    {
+        std::lock_guard<std::mutex> guard(serialLocksGuard);
+        auto &entry = serialLocks[task.serialPort];
+        if (!entry) entry = std::make_shared<std::mutex>();
+        serialLock = entry;
+    }
+    std::lock_guard<std::mutex> transactionGuard(*serialLock);
+
+    if (!connectRtu(connection, task, error)) return false;
+    std::vector<uint8_t> request;
+    request.push_back(static_cast<uint8_t>(task.slaveId));
+    request.push_back(function);
+    appendU16(request, static_cast<uint16_t>(address));
+    if (function == 0x06) appendU16(request, writeRegisters[0]);
+    else {
+        appendU16(request, static_cast<uint16_t>(count));
+        if (function == 0x10) {
+            request.push_back(static_cast<uint8_t>(count * 2));
+            for (int i = 0; i < count; ++i) appendU16(request, writeRegisters[i]);
+        }
+    }
+    txFrame = request;
+    const uint16_t crc = modbusCrc16(request.data(), request.size());
+    txFrame.push_back(static_cast<uint8_t>(crc & 0xFF));
+    txFrame.push_back(static_cast<uint8_t>((crc >> 8) & 0xFF));
+
+    if (modbus_send_raw_request(connection.rtuContext, request.data(), static_cast<int>(request.size())) == -1) {
+        error = std::string("RTU 发送失败: ") + modbus_strerror(errno);
+        return false;
+    }
+    uint8_t response[MODBUS_RTU_MAX_ADU_LENGTH] = {0};
+    const int rc = modbus_receive_confirmation(connection.rtuContext, response);
+    if (rc < 0) { error = std::string("RTU 响应失败: ") + modbus_strerror(errno); return false; }
+    rxFrame.assign(response, response + rc);
+    if (rc < 5 || response[0] != static_cast<uint8_t>(task.slaveId)) { error = "RTU 响应站号或长度错误"; return false; }
+    if (response[1] == static_cast<uint8_t>(function | 0x80)) {
+        error = "设备返回 Modbus 异常码 " + std::to_string(response[2]); return false;
+    }
+    if (response[1] != function) { error = "RTU 响应功能码不匹配"; return false; }
+    if ((function == 0x03 || function == 0x04)) {
+        if (response[2] != count * 2 || rc < 3 + count * 2 + 2) { error = "RTU 读取响应长度错误"; return false; }
+        for (int i = 0; i < count; ++i) readRegisters[i] = readU16(&response[3 + i * 2]);
+    } else if (rc < 8 || readU16(&response[2]) != static_cast<uint16_t>(address) ||
+               readU16(&response[4]) != static_cast<uint16_t>(function == 0x06 ? writeRegisters[0] : count)) {
+        error = "RTU 写响应内容不匹配"; return false;
+    }
+    return true;
 }
 
 
@@ -1355,6 +1460,15 @@ void closeModbusTaskConnection(
     connection.connectedHost.clear();
 
     connection.connectedPort = -1;
+
+    if (connection.rtuContext)
+    {
+        modbus_close(connection.rtuContext);
+        modbus_free(connection.rtuContext);
+        connection.rtuContext = nullptr;
+    }
+    connection.connectedSerialPort.clear();
+    connection.connectedBaudRate = 0;
 }
 
 // ============================================================
@@ -1430,8 +1544,11 @@ void readModbus(
     // 执行真正 Modbus TCP 通讯
     // ========================================================
 
-    const bool ok =
-        readModbusTcpRaw(
+    std::string communicationError;
+    const bool ok = task.transport == "RTU"
+        ? transactRtu(connection, task, static_cast<uint8_t>(p.function), p.address, count,
+                      nullptr, reg, txFrame, rxFrame, communicationError)
+        : readModbusTcpRaw(
             connection,
             task.host,
             task.port,
@@ -1449,6 +1566,7 @@ void readModbus(
     {
         std::cout
             << "读取失败"
+            << (communicationError.empty() ? "" : ": " + communicationError)
             << std::endl;
 
         return;
@@ -1622,10 +1740,14 @@ bool writeModbus(
     const ModbusTask &task,
     const Point &point,
     double value,
-    std::string &error
+    std::string &error,
+    std::string &txTelegram,
+    std::string &rxTelegram
 )
 {
     error.clear();
+    txTelegram.clear();
+    rxTelegram.clear();
 
 
     // ========================================================
@@ -2068,142 +2190,105 @@ bool writeModbus(
     }
 
 
-    // ========================================================
-    // 5. 使用 libmodbus 执行真正写入
-    //
-    // 这里重新建立一个独立写连接，
-    // 避免和现有 raw polling socket 相互干扰。
-    // ========================================================
-
-    modbus_t *ctx =
-        modbus_new_tcp(
-            task.host.c_str(),
-            task.port
-        );
-
-
-    if (ctx == nullptr)
+    // 使用独立原始 TCP 连接执行写入，同时保留实际 TX/RX 报文供监视器显示。
+    ModbusTaskConnection connection;
+    if (task.transport == "RTU")
     {
-        error =
-            "modbus_new_tcp 创建失败";
+        std::vector<uint8_t> txFrame;
+        std::vector<uint8_t> rxFrame;
+        const uint8_t function = count == 1 ? 0x06 : 0x10;
+        const bool ok = transactRtu(connection, task, function, point.address, count,
+                                    registers, nullptr, txFrame, rxFrame, error);
+        txTelegram = txFrame.empty() ? std::string() : bytesToHex(txFrame.data(), txFrame.size());
+        rxTelegram = rxFrame.empty() ? std::string() : bytesToHex(rxFrame.data(), rxFrame.size());
+        closeModbusTaskConnection(connection);
+        return ok;
+    }
 
+    if (!connectRawSocket(connection, task.host, task.port))
+    {
+        error = "连接 Modbus 设备失败";
         return false;
     }
 
+    std::vector<uint8_t> txFrame;
+    const uint16_t transactionId = nextTransactionId(connection);
+    const uint8_t function = count == 1 ? 6 : 16;
+    // MBAP Length 包含 Unit ID 和 PDU，不包含前 6 字节 MBAP 字段。
+    const uint16_t mbapLength = count == 1
+        ? 6
+        : static_cast<uint16_t>(7 + count * 2);
 
-    if (
-        modbus_set_slave(
-            ctx,
-            task.slaveId
-        ) == -1
-    )
-    {
-        error =
-            std::string(
-                "设置 Slave ID 失败: "
-            ) +
-            modbus_strerror(errno);
-
-        modbus_free(ctx);
-
-        return false;
-    }
-
-    const std::uint32_t timeoutSeconds =
-        static_cast<std::uint32_t>(task.timeout / 1000);
-    const std::uint32_t timeoutMicroseconds =
-        static_cast<std::uint32_t>((task.timeout % 1000) * 1000);
-    modbus_set_response_timeout(
-        ctx,
-        timeoutSeconds,
-        timeoutMicroseconds);
-
-
-    if (
-        modbus_connect(ctx) == -1
-    )
-    {
-        error =
-            std::string(
-                "连接 Modbus 设备失败: "
-            ) +
-            modbus_strerror(errno);
-
-        modbus_free(ctx);
-
-        return false;
-    }
-
-
-    // ========================================================
-    // 6. 真正写寄存器
-    // ========================================================
-
-    int rc = -1;
-
-
+    appendU16(txFrame, transactionId);
+    appendU16(txFrame, 0);
+    appendU16(txFrame, mbapLength);
+    txFrame.push_back(static_cast<uint8_t>(task.slaveId));
+    txFrame.push_back(function);
+    appendU16(txFrame, static_cast<uint16_t>(point.address));
     if (count == 1)
     {
-        // FC06 Write Single Register
-        rc =
-            modbus_write_register(
-                ctx,
-                point.address,
-                registers[0]
-            );
-
-
-        if (rc != 1)
-        {
-            error =
-                std::string(
-                    "FC06 写入失败: "
-                ) +
-                modbus_strerror(errno);
-        }
+        appendU16(txFrame, registers[0]);
     }
     else
     {
-        // FC16 Write Multiple Registers
-        rc =
-            modbus_write_registers(
-                ctx,
-                point.address,
-                count,
-                registers
-            );
-
-
-        if (rc != count)
-        {
-            error =
-                std::string(
-                    "FC16 写入失败: "
-                ) +
-                modbus_strerror(errno);
-        }
+        appendU16(txFrame, static_cast<uint16_t>(count));
+        txFrame.push_back(static_cast<uint8_t>(count * 2));
+        for (int i = 0; i < count; ++i)
+            appendU16(txFrame, registers[i]);
     }
 
-
-    // ========================================================
-    // 7. 关闭写连接
-    // ========================================================
-
-    modbus_close(ctx);
-    modbus_free(ctx);
-
-
-    if (rc < 0)
+    txTelegram = bytesToHex(txFrame.data(), txFrame.size());
+    if (!sendAll(connection.socketFd, txFrame.data(), txFrame.size()))
     {
+        error = function == 6 ? "FC06 发送失败" : "FC16 发送失败";
+        closeModbusTaskConnection(connection);
         return false;
     }
 
-
-    if (
-        (count == 1 && rc != 1) ||
-        (count > 1 && rc != count)
-    )
+    uint8_t header[7] = {0};
+    if (!recvAll(connection.socketFd, header, sizeof(header)))
     {
+        error = function == 6 ? "FC06 响应超时" : "FC16 响应超时";
+        closeModbusTaskConnection(connection);
+        return false;
+    }
+    const uint16_t responseLength = readU16(&header[4]);
+    if (responseLength < 2 || responseLength > 253)
+    {
+        error = "写响应的 MBAP 长度非法";
+        closeModbusTaskConnection(connection);
+        return false;
+    }
+    std::vector<uint8_t> rxFrame(header, header + sizeof(header));
+    std::vector<uint8_t> body(static_cast<size_t>(responseLength - 1));
+    if (!recvAll(connection.socketFd, body.data(), body.size()))
+    {
+        error = "写响应接收不完整";
+        closeModbusTaskConnection(connection);
+        return false;
+    }
+    rxFrame.insert(rxFrame.end(), body.begin(), body.end());
+    rxTelegram = bytesToHex(rxFrame.data(), rxFrame.size());
+    closeModbusTaskConnection(connection);
+
+    if (readU16(&header[0]) != transactionId || readU16(&header[2]) != 0 ||
+        header[6] != static_cast<uint8_t>(task.slaveId))
+    {
+        error = "写响应的 MBAP 头与请求不匹配";
+        return false;
+    }
+    if (body.empty() || body[0] != function)
+    {
+        if (!body.empty() && body[0] == static_cast<uint8_t>(function | 0x80))
+            error = "设备返回 Modbus 异常码 " + std::to_string(body.size() > 1 ? body[1] : 0);
+        else
+            error = "写响应功能码与请求不匹配";
+        return false;
+    }
+    if (body.size() != 5 || readU16(&body[1]) != static_cast<uint16_t>(point.address) ||
+        readU16(&body[3]) != static_cast<uint16_t>(count == 1 ? registers[0] : count))
+    {
+        error = "写响应内容与请求不匹配";
         return false;
     }
 
