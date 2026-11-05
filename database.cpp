@@ -3,987 +3,251 @@
 #include <sqlite3.h>
 
 #include <iostream>
-#include <string>
-#include <vector>
 
+namespace {
 
-namespace
+std::string columnText(sqlite3_stmt *stmt, int column)
 {
-
-// ============================================================
-// 安全读取 SQLite TEXT
-// ============================================================
-
-std::string columnText(
-    sqlite3_stmt *stmt,
-    int column
-)
-{
-    const unsigned char *text =
-        sqlite3_column_text(
-            stmt,
-            column
-        );
-
-    if (text == nullptr)
-    {
-        return std::string();
-    }
-
-    return reinterpret_cast<
-        const char *
-    >(text);
+    const auto *text = sqlite3_column_text(stmt, column);
+    return text ? reinterpret_cast<const char *>(text) : std::string();
 }
 
-
-// ============================================================
-// 打印 SQLite 错误
-// ============================================================
-
-void printSqliteError(
-    const char *prefix,
-    sqlite3 *conn
-)
+void printSqliteError(const char *prefix, sqlite3 *db)
 {
-    std::cerr
-        << prefix
-        << ": ";
-
-    if (conn)
-    {
-        std::cerr
-            << sqlite3_errmsg(conn);
-    }
-    else
-    {
-        std::cerr
-            << "unknown sqlite error";
-    }
-
-    std::cerr
-        << std::endl;
+    std::cerr << prefix << ": " << (db ? sqlite3_errmsg(db) : "unknown sqlite error")
+              << std::endl;
 }
+
+bool openDatabase(const std::string &path, sqlite3 **db)
+{
+    if (sqlite3_open(path.c_str(), db) == SQLITE_OK)
+        return true;
+    printSqliteError("打开数据库失败", *db);
+    if (*db)
+        sqlite3_close(*db);
+    *db = nullptr;
+    return false;
+}
+
+void ensureRtuColumns(sqlite3 *db)
+{
+    // ALTER TABLE 没有 IF NOT EXISTS；重复列错误可忽略。这样旧 TCP 数据库无需单独升级。
+    static const char *migrations[] = {
+        "ALTER TABLE modbus_tasks ADD COLUMN transport TEXT NOT NULL DEFAULT 'TCP';",
+        "ALTER TABLE modbus_tasks ADD COLUMN serial_port TEXT NOT NULL DEFAULT '/dev/ttyS0';",
+        "ALTER TABLE modbus_tasks ADD COLUMN baud_rate INTEGER NOT NULL DEFAULT 9600;",
+        "ALTER TABLE modbus_tasks ADD COLUMN parity TEXT NOT NULL DEFAULT 'N';",
+        "ALTER TABLE modbus_tasks ADD COLUMN data_bits INTEGER NOT NULL DEFAULT 8;",
+        "ALTER TABLE modbus_tasks ADD COLUMN stop_bits INTEGER NOT NULL DEFAULT 1;"
+    };
+    for (const char *sql : migrations)
+        sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
+}
+
+std::string normalizedDirection(sqlite3_stmt *stmt, int column)
+{
+    return columnText(stmt, column) == "OUTPUT" ? "OUTPUT" : "INPUT";
+}
+
+ModbusTask readTask(sqlite3_stmt *stmt)
+{
+    ModbusTask task;
+    task.id = sqlite3_column_int(stmt, 0);
+    task.name = columnText(stmt, 1);
+    task.host = columnText(stmt, 2);
+    task.port = sqlite3_column_int(stmt, 3);
+    task.slaveId = sqlite3_column_int(stmt, 4);
+    task.period = sqlite3_column_int(stmt, 5);
+    task.timeout = sqlite3_column_int(stmt, 6);
+    task.retryCount = sqlite3_column_int(stmt, 7);
+    task.reconnectInterval = sqlite3_column_int(stmt, 8);
+    task.enable = sqlite3_column_int(stmt, 9) != 0;
+    task.transport = columnText(stmt, 10);
+    task.serialPort = columnText(stmt, 11);
+    task.baudRate = sqlite3_column_int(stmt, 12);
+    const std::string parity = columnText(stmt, 13);
+    task.parity = parity.empty() ? 'N' : parity.front();
+    task.dataBits = sqlite3_column_int(stmt, 14);
+    task.stopBits = sqlite3_column_int(stmt, 15);
+    return task;
+}
+
+Point readLegacyPoint(sqlite3_stmt *stmt)
+{
+    Point point;
+    point.id = sqlite3_column_int(stmt, 0);
+    point.taskId = sqlite3_column_int(stmt, 1);
+    point.name = columnText(stmt, 2);
+    point.slave = sqlite3_column_int(stmt, 3);
+    point.function = sqlite3_column_int(stmt, 4);
+    point.address = sqlite3_column_int(stmt, 5);
+    point.datatype = columnText(stmt, 6);
+    point.byteOrder = columnText(stmt, 7);
+    point.period = sqlite3_column_int(stmt, 8);
+    point.enable = sqlite3_column_int(stmt, 9) != 0;
+    point.direction = normalizedDirection(stmt, 10);
+    return point;
+}
+
+constexpr const char *kTaskColumns =
+    "id,name,host,port,slave_id,period,timeout,retry_count,reconnect_interval,enable,"
+    "transport,serial_port,baud_rate,parity,data_bits,stop_bits";
 
 } // namespace
 
-
-// ============================================================
-// 旧接口：加载所有启用点
-//
-// 暂时保留，兼容现有代码。
-// ============================================================
-
-std::vector<Point>
-loadPoints(
-    std::string db
-)
+std::vector<Point> loadPoints(std::string dbPath)
 {
-    std::vector<Point> result;
-
-    sqlite3 *conn = nullptr;
-
-
-    if (
-        sqlite3_open(
-            db.c_str(),
-            &conn
-        )
-        !=
-        SQLITE_OK
-    )
-    {
-        printSqliteError(
-            "打开数据库失败",
-            conn
-        );
-
-        if (conn)
-        {
-            sqlite3_close(conn);
-        }
-
-        return result;
-    }
-
+    std::vector<Point> points;
+    sqlite3 *db = nullptr;
+    if (!openDatabase(dbPath, &db))
+        return points;
 
     const char *sql =
-        "SELECT "
-        "id, "
-        "task_id, "
-        "name, "
-        "slave_id, "
-        "function, "
-        "address, "
-        "datatype, "
-        "byte_order, "
-        "period, "
-        "enable, "
-        "direction "
-        "FROM modbus_points "
-        "WHERE enable = 1 "
-        "ORDER BY id;";
-
-
+        "SELECT id,task_id,name,slave_id,function,address,datatype,byte_order,period,enable,"
+        "direction FROM modbus_points WHERE enable=1 ORDER BY id;";
     sqlite3_stmt *stmt = nullptr;
-
-
-    if (
-        sqlite3_prepare_v2(
-            conn,
-            sql,
-            -1,
-            &stmt,
-            nullptr
-        )
-        !=
-        SQLITE_OK
-    )
-    {
-        printSqliteError(
-            "读取 modbus_points 准备 SQL 失败",
-            conn
-        );
-
-        sqlite3_close(conn);
-
-        return result;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+        printSqliteError("读取 modbus_points 准备 SQL 失败", db);
+        sqlite3_close(db);
+        return points;
     }
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+        points.push_back(readLegacyPoint(stmt));
 
-
-    while (
-        sqlite3_step(stmt)
-        ==
-        SQLITE_ROW
-    )
-    {
-        Point p;
-
-        p.id =
-            sqlite3_column_int(
-                stmt,
-                0
-            );
-
-        p.taskId =
-            sqlite3_column_int(
-                stmt,
-                1
-            );
-
-        p.name =
-            columnText(
-                stmt,
-                2
-            );
-
-        p.slave =
-            sqlite3_column_int(
-                stmt,
-                3
-            );
-
-        p.function =
-            sqlite3_column_int(
-                stmt,
-                4
-            );
-
-        p.address =
-            sqlite3_column_int(
-                stmt,
-                5
-            );
-
-        p.datatype =
-            columnText(
-                stmt,
-                6
-            );
-
-        p.byteOrder =
-            columnText(
-                stmt,
-                7
-            );
-
-        p.period =
-            sqlite3_column_int(
-                stmt,
-                8
-            );
-
-        p.enable =
-            sqlite3_column_int(
-                stmt,
-                9
-            )
-            !=
-            0;
-
-        p.direction = columnText(stmt, 10);
-        if (p.direction != "OUTPUT")
-            p.direction = "INPUT";
-
-
-        result.push_back(
-            p
-        );
-    }
-
-
-    sqlite3_finalize(
-        stmt
-    );
-
-    sqlite3_close(
-        conn
-    );
-
-
-    return result;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return points;
 }
 
-
-// ============================================================
-// 新接口：加载 Modbus 任务
-// ============================================================
-
-std::vector<ModbusTask>
-loadModbusTasks(
-    const std::string &db
-)
+std::vector<ModbusTask> loadModbusTasks(const std::string &dbPath)
 {
     std::vector<ModbusTask> tasks;
+    sqlite3 *db = nullptr;
+    if (!openDatabase(dbPath, &db))
+        return tasks;
+    ensureRtuColumns(db);
 
-    sqlite3 *conn = nullptr;
-
-
-    // ========================================================
-    // 1. 打开数据库
-    // ========================================================
-
-    if (
-        sqlite3_open(
-            db.c_str(),
-            &conn
-        )
-        !=
-        SQLITE_OK
-    )
-    {
-        printSqliteError(
-            "打开数据库失败",
-            conn
-        );
-
-        if (conn)
-        {
-            sqlite3_close(
-                conn
-            );
-        }
-
+    const std::string taskSql = std::string("SELECT ") + kTaskColumns
+        + " FROM modbus_tasks WHERE enable=1 ORDER BY id;";
+    sqlite3_stmt *taskStmt = nullptr;
+    if (sqlite3_prepare_v2(db, taskSql.c_str(), -1, &taskStmt, nullptr) != SQLITE_OK) {
+        printSqliteError("读取 modbus_tasks 准备 SQL 失败", db);
+        sqlite3_close(db);
         return tasks;
     }
-
-    // 向后兼容：已有 TCP 数据库首次启动时自动补齐 RTU 配置列。
-    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN transport TEXT NOT NULL DEFAULT 'TCP';", nullptr, nullptr, nullptr);
-    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN serial_port TEXT NOT NULL DEFAULT '/dev/ttyS0';", nullptr, nullptr, nullptr);
-    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN baud_rate INTEGER NOT NULL DEFAULT 9600;", nullptr, nullptr, nullptr);
-    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN parity TEXT NOT NULL DEFAULT 'N';", nullptr, nullptr, nullptr);
-    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN data_bits INTEGER NOT NULL DEFAULT 8;", nullptr, nullptr, nullptr);
-    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN stop_bits INTEGER NOT NULL DEFAULT 1;", nullptr, nullptr, nullptr);
-
-
-    // ========================================================
-    // 2. 加载所有启用的 Modbus 任务
-    // ========================================================
-
-    const char *taskSql =
-        "SELECT "
-        "id, "
-        "name, "
-        "host, "
-        "port, "
-        "slave_id, "
-        "period, "
-        "timeout, "
-        "retry_count, "
-        "reconnect_interval, "
-        "enable, transport, serial_port, baud_rate, parity, data_bits, stop_bits "
-        "FROM modbus_tasks "
-        "WHERE enable = 1 "
-        "ORDER BY id;";
-
-
-    sqlite3_stmt *taskStmt =
-        nullptr;
-
-
-    if (
-        sqlite3_prepare_v2(
-            conn,
-            taskSql,
-            -1,
-            &taskStmt,
-            nullptr
-        )
-        !=
-        SQLITE_OK
-    )
-    {
-        printSqliteError(
-            "读取 modbus_tasks 准备 SQL 失败",
-            conn
-        );
-
-        sqlite3_close(
-            conn
-        );
-
-        return tasks;
-    }
-
-
-    while (
-        sqlite3_step(taskStmt)
-        ==
-        SQLITE_ROW
-    )
-    {
-        ModbusTask task;
-
-        task.id =
-            sqlite3_column_int(
-                taskStmt,
-                0
-            );
-
-        task.name =
-            columnText(
-                taskStmt,
-                1
-            );
-
-        task.host =
-            columnText(
-                taskStmt,
-                2
-            );
-
-        task.port =
-            sqlite3_column_int(
-                taskStmt,
-                3
-            );
-
-        task.slaveId =
-            sqlite3_column_int(
-                taskStmt,
-                4
-            );
-
-        task.period =
-            sqlite3_column_int(
-                taskStmt,
-                5
-            );
-
-        task.timeout =
-            sqlite3_column_int(
-                taskStmt,
-                6
-            );
-
-        task.retryCount =
-            sqlite3_column_int(
-                taskStmt,
-                7
-            );
-
-        task.reconnectInterval =
-            sqlite3_column_int(
-                taskStmt,
-                8
-            );
-
-        task.enable =
-            sqlite3_column_int(
-                taskStmt,
-                9
-            )
-            !=
-            0;
-
-        task.transport = columnText(taskStmt, 10);
-        task.serialPort = columnText(taskStmt, 11);
-        task.baudRate = sqlite3_column_int(taskStmt, 12);
-        const std::string parity = columnText(taskStmt, 13);
-        task.parity = parity.empty() ? 'N' : parity.front();
-        task.dataBits = sqlite3_column_int(taskStmt, 14);
-        task.stopBits = sqlite3_column_int(taskStmt, 15);
-
-
-        tasks.push_back(
-            task
-        );
-    }
-
-
-    sqlite3_finalize(
-        taskStmt
-    );
-
-
-    // ========================================================
-    // 3. 为每一个任务读取自己的点
-    // ========================================================
+    while (sqlite3_step(taskStmt) == SQLITE_ROW)
+        tasks.push_back(readTask(taskStmt));
+    sqlite3_finalize(taskStmt);
 
     const char *pointSql =
-        "SELECT "
-        "id, "
-        "task_id, "
-        "name, "
-        "slave_id, "
-        "function, "
-        "address, "
-        "datatype, "
-        "byte_order, "
-        "period, "
-        "enable, "
-        "direction "
-        "FROM modbus_points "
-        "WHERE task_id = ? "
-        "AND enable = 1 "
-        "ORDER BY id;";
-
-
-    sqlite3_stmt *pointStmt =
-        nullptr;
-
-
-    if (
-        sqlite3_prepare_v2(
-            conn,
-            pointSql,
-            -1,
-            &pointStmt,
-            nullptr
-        )
-        !=
-        SQLITE_OK
-    )
-    {
-        printSqliteError(
-            "读取任务点表准备 SQL 失败",
-            conn
-        );
-
-        sqlite3_close(
-            conn
-        );
-
+        "SELECT id,task_id,name,slave_id,function,address,datatype,byte_order,period,enable,"
+        "direction FROM modbus_points WHERE task_id=? AND enable=1 ORDER BY id;";
+    sqlite3_stmt *pointStmt = nullptr;
+    if (sqlite3_prepare_v2(db, pointSql, -1, &pointStmt, nullptr) != SQLITE_OK) {
+        printSqliteError("读取任务点表准备 SQL 失败", db);
+        sqlite3_close(db);
         return {};
     }
 
-
-    for (
-        auto &task :
-        tasks
-    )
-    {
-        sqlite3_reset(
-            pointStmt
-        );
-
-        sqlite3_clear_bindings(
-            pointStmt
-        );
-
-
-        sqlite3_bind_int(
-            pointStmt,
-            1,
-            task.id
-        );
-
-
-        while (
-            sqlite3_step(pointStmt)
-            ==
-            SQLITE_ROW
-        )
-        {
-            Point p;
-
-            p.id =
-                sqlite3_column_int(
-                    pointStmt,
-                    0
-                );
-
-            p.taskId =
-                sqlite3_column_int(
-                    pointStmt,
-                    1
-                );
-
-            p.name =
-                columnText(
-                    pointStmt,
-                    2
-                );
-
-            // -----------------------------------------------
-            // 这里暂时仍读取旧字段。
-            //
-            // 但真正运行时：
-            // slave / period 应该属于 task。
-            //
-            // 为了让下一阶段改动更安全，
-            // 这里直接使用任务配置覆盖旧值。
-            // -----------------------------------------------
-
-            p.slave =
-                task.slaveId;
-
-            p.function =
-                sqlite3_column_int(
-                    pointStmt,
-                    4
-                );
-
-            p.address =
-                sqlite3_column_int(
-                    pointStmt,
-                    5
-                );
-
-            p.datatype =
-                columnText(
-                    pointStmt,
-                    6
-                );
-
-            p.byteOrder =
-                columnText(
-                    pointStmt,
-                    7
-                );
-
-            p.period =
-                task.period;
-
-            p.enable =
-                sqlite3_column_int(
-                    pointStmt,
-                    9
-                )
-                !=
-                0;
-
-            p.direction = columnText(pointStmt, 10);
-            if (p.direction != "OUTPUT")
-                p.direction = "INPUT";
-
-
-            task.points.push_back(
-                p
-            );
+    for (auto &task : tasks) {
+        sqlite3_reset(pointStmt);
+        sqlite3_clear_bindings(pointStmt);
+        sqlite3_bind_int(pointStmt, 1, task.id);
+        while (sqlite3_step(pointStmt) == SQLITE_ROW) {
+            Point point = readLegacyPoint(pointStmt);
+            // slave 和周期属于连接任务。覆盖点表旧字段可兼容旧库，又避免运行参数出现两套来源。
+            point.slave = task.slaveId;
+            point.period = task.period;
+            task.points.push_back(std::move(point));
         }
     }
 
-
-    sqlite3_finalize(
-        pointStmt
-    );
-
-    sqlite3_close(
-        conn
-    );
-
-
+    sqlite3_finalize(pointStmt);
+    sqlite3_close(db);
     return tasks;
 }
-// ============================================================
-// 根据 taskId + pointId 加载任务和点
-// ============================================================
 
-bool loadModbusTaskPoint(
-    const std::string &db,
-    int taskId,
-    int pointId,
-    ModbusTask &task,
-    Point &point,
-    std::string &error
-)
+bool loadModbusTaskPoint(const std::string &dbPath, int taskId, int pointId,
+                         ModbusTask &task, Point &point, std::string &error)
 {
     error.clear();
-
-    task = ModbusTask{};
-    point = Point{};
-
-
-    if (taskId <= 0)
-    {
+    task = {};
+    point = {};
+    if (taskId <= 0) {
         error = "非法 taskId";
         return false;
     }
-
-
-    if (pointId <= 0)
-    {
+    if (pointId <= 0) {
         error = "非法 pointId";
         return false;
     }
 
-
-    sqlite3 *conn = nullptr;
-
-
-    if (
-        sqlite3_open(
-            db.c_str(),
-            &conn
-        )
-        !=
-        SQLITE_OK
-    )
-    {
-        error =
-            conn
-            ? sqlite3_errmsg(conn)
-            : "无法打开数据库";
-
-        if (conn)
-        {
-            sqlite3_close(conn);
-        }
-
+    sqlite3 *db = nullptr;
+    if (!openDatabase(dbPath, &db)) {
+        error = "无法打开数据库";
         return false;
     }
+    ensureRtuColumns(db);
 
-
-    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN transport TEXT NOT NULL DEFAULT 'TCP';", nullptr, nullptr, nullptr);
-    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN serial_port TEXT NOT NULL DEFAULT '/dev/ttyS0';", nullptr, nullptr, nullptr);
-    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN baud_rate INTEGER NOT NULL DEFAULT 9600;", nullptr, nullptr, nullptr);
-    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN parity TEXT NOT NULL DEFAULT 'N';", nullptr, nullptr, nullptr);
-    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN data_bits INTEGER NOT NULL DEFAULT 8;", nullptr, nullptr, nullptr);
-    sqlite3_exec(conn, "ALTER TABLE modbus_tasks ADD COLUMN stop_bits INTEGER NOT NULL DEFAULT 1;", nullptr, nullptr, nullptr);
-
-
-    // ========================================================
-    // 1. 查任务
-    // ========================================================
-
-    const char *taskSql =
-        "SELECT "
-        "id, "
-        "name, "
-        "host, "
-        "port, "
-        "slave_id, "
-        "period, "
-        "timeout, "
-        "retry_count, "
-        "reconnect_interval, "
-        "enable, transport, serial_port, baud_rate, parity, data_bits, stop_bits "
-        "FROM modbus_tasks "
-        "WHERE id = ?;";
-
-
+    const std::string taskSql = std::string("SELECT ") + kTaskColumns
+        + " FROM modbus_tasks WHERE id=?;";
     sqlite3_stmt *taskStmt = nullptr;
-
-
-    if (
-        sqlite3_prepare_v2(
-            conn,
-            taskSql,
-            -1,
-            &taskStmt,
-            nullptr
-        )
-        !=
-        SQLITE_OK
-    )
-    {
-        error = sqlite3_errmsg(conn);
-
-        sqlite3_close(conn);
-
+    if (sqlite3_prepare_v2(db, taskSql.c_str(), -1, &taskStmt, nullptr) != SQLITE_OK) {
+        error = sqlite3_errmsg(db);
+        sqlite3_close(db);
         return false;
     }
-
-
-    sqlite3_bind_int(
-        taskStmt,
-        1,
-        taskId
-    );
-
-
-    if (
-        sqlite3_step(taskStmt)
-        !=
-        SQLITE_ROW
-    )
-    {
+    sqlite3_bind_int(taskStmt, 1, taskId);
+    if (sqlite3_step(taskStmt) != SQLITE_ROW) {
         sqlite3_finalize(taskStmt);
-        sqlite3_close(conn);
-
+        sqlite3_close(db);
         error = "指定的 Modbus 任务不存在";
-
         return false;
     }
-
-
-    task.id =
-        sqlite3_column_int(
-            taskStmt,
-            0
-        );
-
-    task.name =
-        columnText(
-            taskStmt,
-            1
-        );
-
-    task.host =
-        columnText(
-            taskStmt,
-            2
-        );
-
-    task.port =
-        sqlite3_column_int(
-            taskStmt,
-            3
-        );
-
-    task.slaveId =
-        sqlite3_column_int(
-            taskStmt,
-            4
-        );
-
-    task.period =
-        sqlite3_column_int(
-            taskStmt,
-            5
-        );
-
-    task.timeout =
-        sqlite3_column_int(
-            taskStmt,
-            6
-        );
-
-    task.retryCount =
-        sqlite3_column_int(
-            taskStmt,
-            7
-        );
-
-    task.reconnectInterval =
-        sqlite3_column_int(
-            taskStmt,
-            8
-        );
-
-    task.enable =
-        sqlite3_column_int(
-            taskStmt,
-            9
-        )
-        !=
-        0;
-
-    task.transport = columnText(taskStmt, 10);
-    task.serialPort = columnText(taskStmt, 11);
-    task.baudRate = sqlite3_column_int(taskStmt, 12);
-    const std::string taskParity = columnText(taskStmt, 13);
-    task.parity = taskParity.empty() ? 'N' : taskParity.front();
-    task.dataBits = sqlite3_column_int(taskStmt, 14);
-    task.stopBits = sqlite3_column_int(taskStmt, 15);
-
-
-    sqlite3_finalize(
-        taskStmt
-    );
-
-
-    if (!task.enable)
-    {
-        sqlite3_close(conn);
-
+    task = readTask(taskStmt);
+    sqlite3_finalize(taskStmt);
+    if (!task.enable) {
+        sqlite3_close(db);
         error = "指定的 Modbus 任务已停用";
-
         return false;
     }
 
-
-    // ========================================================
-    // 2. 查点
-    //
-    // 这里必须同时限制：
-    //
-    // id = pointId
-    // task_id = taskId
-    //
-    // 防止客户端把错误 taskId 和 pointId 拼在一起。
-    // ========================================================
-
+    // 两个条件缺一不可，否则调用方可能用其他任务的串口参数写入当前点。
     const char *pointSql =
-        "SELECT "
-        "id, "
-        "task_id, "
-        "name, "
-        "function, "
-        "address, "
-        "datatype, "
-        "byte_order, "
-        "enable, "
-        "direction "
-        "FROM modbus_points "
-        "WHERE id = ? "
-        "AND task_id = ?;";
-
-
+        "SELECT id,task_id,name,function,address,datatype,byte_order,enable,direction "
+        "FROM modbus_points WHERE id=? AND task_id=?;";
     sqlite3_stmt *pointStmt = nullptr;
-
-
-    if (
-        sqlite3_prepare_v2(
-            conn,
-            pointSql,
-            -1,
-            &pointStmt,
-            nullptr
-        )
-        !=
-        SQLITE_OK
-    )
-    {
-        error = sqlite3_errmsg(conn);
-
-        sqlite3_close(conn);
-
+    if (sqlite3_prepare_v2(db, pointSql, -1, &pointStmt, nullptr) != SQLITE_OK) {
+        error = sqlite3_errmsg(db);
+        sqlite3_close(db);
         return false;
     }
-
-
-    sqlite3_bind_int(
-        pointStmt,
-        1,
-        pointId
-    );
-
-    sqlite3_bind_int(
-        pointStmt,
-        2,
-        taskId
-    );
-
-
-    if (
-        sqlite3_step(pointStmt)
-        !=
-        SQLITE_ROW
-    )
-    {
+    sqlite3_bind_int(pointStmt, 1, pointId);
+    sqlite3_bind_int(pointStmt, 2, taskId);
+    if (sqlite3_step(pointStmt) != SQLITE_ROW) {
         sqlite3_finalize(pointStmt);
-        sqlite3_close(conn);
-
-        error =
-            "指定点不存在，或该点不属于指定 Modbus 任务";
-
+        sqlite3_close(db);
+        error = "指定点不存在，或该点不属于指定 Modbus 任务";
         return false;
     }
 
+    point.id = sqlite3_column_int(pointStmt, 0);
+    point.taskId = sqlite3_column_int(pointStmt, 1);
+    point.name = columnText(pointStmt, 2);
+    point.function = sqlite3_column_int(pointStmt, 3);
+    point.address = sqlite3_column_int(pointStmt, 4);
+    point.datatype = columnText(pointStmt, 5);
+    point.byteOrder = columnText(pointStmt, 6);
+    point.enable = sqlite3_column_int(pointStmt, 7) != 0;
+    point.direction = normalizedDirection(pointStmt, 8);
+    point.slave = task.slaveId;
+    point.period = task.period;
 
-    point.id =
-        sqlite3_column_int(
-            pointStmt,
-            0
-        );
-
-    point.taskId =
-        sqlite3_column_int(
-            pointStmt,
-            1
-        );
-
-    point.name =
-        columnText(
-            pointStmt,
-            2
-        );
-
-    point.function =
-        sqlite3_column_int(
-            pointStmt,
-            3
-        );
-
-    point.address =
-        sqlite3_column_int(
-            pointStmt,
-            4
-        );
-
-    point.datatype =
-        columnText(
-            pointStmt,
-            5
-        );
-
-    point.byteOrder =
-        columnText(
-            pointStmt,
-            6
-        );
-
-    point.enable =
-        sqlite3_column_int(
-            pointStmt,
-            7
-        )
-        !=
-        0;
-
-    point.direction = columnText(pointStmt, 8);
-    if (point.direction != "OUTPUT")
-        point.direction = "INPUT";
-
-
-    // 兼容旧代码。
-    //
-    // 真正运行参数来自 task，
-    // 但暂时同步到 Point，避免其他旧逻辑受到影响。
-
-    point.slave =
-        task.slaveId;
-
-    point.period =
-        task.period;
-
-
-    sqlite3_finalize(
-        pointStmt
-    );
-
-    sqlite3_close(
-        conn
-    );
-
-
-    if (!point.enable)
-    {
+    sqlite3_finalize(pointStmt);
+    sqlite3_close(db);
+    if (!point.enable) {
         error = "指定 Modbus 点已停用";
         return false;
     }
-
-
     return true;
 }
