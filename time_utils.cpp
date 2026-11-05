@@ -16,7 +16,6 @@ tm *t=
 localtime(&now);
 
 
-
 std::stringstream ss;
 
 
@@ -38,7 +37,6 @@ ss
 <<":"
 <<std::setw(2)
 <<t->tm_sec;
-
 
 
 return ss.str();

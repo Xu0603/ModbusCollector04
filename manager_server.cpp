@@ -23,7 +23,6 @@
 #include <cmath>
 
 
-// ============================================================
 // PYSM 协议
 //
 // RetroDcsDemo 的 ManagerClient 使用：
@@ -37,7 +36,6 @@
 // 总计 16 bytes
 //
 // 所有整数使用 BigEndian
-// ============================================================
 
 namespace
 {
@@ -53,9 +51,7 @@ constexpr size_t PYSM_HEADER_SIZE = 16;
 constexpr uint32_t MAX_PAYLOAD_SIZE = 1024 * 1024;
 
 
-// ------------------------------------------------------------
 // 写入 uint16 大端
-// ------------------------------------------------------------
 
 void writeU16(
     unsigned char* buffer,
@@ -70,9 +66,7 @@ void writeU16(
 }
 
 
-// ------------------------------------------------------------
 // 写入 uint32 大端
-// ------------------------------------------------------------
 
 void writeU32(
     unsigned char* buffer,
@@ -93,9 +87,7 @@ void writeU32(
 }
 
 
-// ------------------------------------------------------------
 // 从 uint16 大端读取
-// ------------------------------------------------------------
 
 uint16_t readU16(
     const unsigned char* buffer
@@ -108,9 +100,7 @@ uint16_t readU16(
 }
 
 
-// ------------------------------------------------------------
 // 从 uint32 大端读取
-// ------------------------------------------------------------
 
 uint32_t readU32(
     const unsigned char* buffer
@@ -124,7 +114,6 @@ uint32_t readU32(
 }
 
 
-// ------------------------------------------------------------
 // 从 JSON 中读取简单字符串
 //
 // 这里暂时不引入 JSON 库，避免给你的 ModbusCollector
@@ -133,7 +122,6 @@ uint32_t readU32(
 // 用于读取：
 // "configHash":"xxx"
 // "value":"123.45"
-// ------------------------------------------------------------
 
 std::string getJsonString(
     const std::string& json,
@@ -226,9 +214,7 @@ std::string getJsonString(
 }
 
 
-// ------------------------------------------------------------
 // 从 JSON 中读取整数
-// ------------------------------------------------------------
 
 long long getJsonInteger(
     const std::string& json,
@@ -303,9 +289,7 @@ long long getJsonInteger(
 }
 
 
-// ------------------------------------------------------------
 // 读取 double
-// ------------------------------------------------------------
 
 double getJsonDouble(
     const std::string& json,
@@ -381,9 +365,7 @@ double getJsonDouble(
 } // namespace
 
 
-// ============================================================
 // 构造
-// ============================================================
 
 ManagerServer::ManagerServer(
     const std::string& host,
@@ -400,9 +382,7 @@ ManagerServer::ManagerServer(
 }
 
 
-// ============================================================
 // 析构
-// ============================================================
 
 ManagerServer::~ManagerServer()
 {
@@ -410,9 +390,7 @@ ManagerServer::~ManagerServer()
 }
 
 
-// ============================================================
 // 创建 TCP Server
-// ============================================================
 
 bool ManagerServer::createServerSocket()
 {
@@ -532,9 +510,7 @@ bool ManagerServer::createServerSocket()
 }
 
 
-// ============================================================
 // 关闭 TCP Server
-// ============================================================
 
 void ManagerServer::closeServerSocket()
 {
@@ -547,9 +523,7 @@ void ManagerServer::closeServerSocket()
 }
 
 
-// ============================================================
 // start
-// ============================================================
 
 bool ManagerServer::start()
 {
@@ -592,9 +566,7 @@ bool ManagerServer::start()
 }
 
 
-// ============================================================
 // stop
-// ============================================================
 
 void ManagerServer::stop()
 {
@@ -608,9 +580,7 @@ void ManagerServer::stop()
 }
 
 
-// ============================================================
 // run
-// ============================================================
 
 void ManagerServer::run()
 {
@@ -662,9 +632,7 @@ void ManagerServer::run()
 }
 
 
-// ============================================================
 // readExact
-// ============================================================
 
 bool ManagerServer::readExact(
     int fd,
@@ -711,9 +679,7 @@ bool ManagerServer::readExact(
 }
 
 
-// ============================================================
 // writeAll
-// ============================================================
 
 bool ManagerServer::writeAll(
     int fd,
@@ -760,9 +726,7 @@ bool ManagerServer::writeAll(
 }
 
 
-// ============================================================
 // 发送 PYSM 响应
-// ============================================================
 
 bool ManagerServer::sendResponse(
     int clientFd,
@@ -844,9 +808,7 @@ bool ManagerServer::sendResponse(
 }
 
 
-// ============================================================
 // 处理一个客户端
-// ============================================================
 
 void ManagerServer::handleClient(
     int clientFd
@@ -965,9 +927,7 @@ void ManagerServer::handleClient(
 }
 
 
-// ============================================================
 // 请求分发
-// ============================================================
 
 std::string ManagerServer::handleRequest(
     uint16_t messageType,
@@ -1010,9 +970,7 @@ std::string ManagerServer::handleRequest(
 }
 
 
-// ============================================================
 // JSON escape
-// ============================================================
 
 std::string ManagerServer::jsonEscape(
     const std::string& value
@@ -1087,9 +1045,7 @@ std::string ManagerServer::jsonEscape(
 }
 
 
-// ============================================================
 // double 转 JSON
-// ============================================================
 
 std::string ManagerServer::doubleToJson(
     double value
@@ -1113,7 +1069,6 @@ std::string ManagerServer::doubleToJson(
 }
 
 
-// ============================================================
 // 时间字符串转换为纳秒
 //
 // ModbusCollector 当前时间格式：
@@ -1122,7 +1077,6 @@ std::string ManagerServer::doubleToJson(
 //
 // 例如：
 // 2026-08-26 22:30:15
-// ============================================================
 
 long long ManagerServer::timestampToNs(
     const std::string& timestamp
@@ -1187,9 +1141,7 @@ long long ManagerServer::timestampToNs(
 }
 
 
-// ============================================================
 // PING
-// ============================================================
 
 std::string ManagerServer::handlePing(
     const std::string& payload
@@ -1225,9 +1177,7 @@ std::string ManagerServer::handlePing(
 }
 
 
-// ============================================================
 // 在线数据快照
-// ============================================================
 
 std::string ManagerServer::handleSnapshot()
 {
@@ -1325,10 +1275,8 @@ std::string ManagerServer::handleSnapshot()
         json
             << "{"
 
-            // ====================================================
             // 旧兼容 ID
             // 暂时保留，避免影响 Qt 现有代码
-            // ====================================================
 
             << "\"id\":"
             << pointId
@@ -1339,9 +1287,7 @@ std::string ManagerServer::handleSnapshot()
             << ","
 
 
-            // ====================================================
             // 多 Modbus 任务真实身份
-            // ====================================================
 
             << "\"taskId\":"
             << variable.taskId
@@ -1352,9 +1298,7 @@ std::string ManagerServer::handleSnapshot()
             << ","
 
 
-            // ====================================================
             // name
-            // ====================================================
 
             << "\"name\":\""
             << jsonEscape(
@@ -1434,7 +1378,6 @@ std::string ManagerServer::handleSnapshot()
 }
 
 
-// ============================================================
 // 强制修改点值
 //
 // RetroDcsDemo 的 forceOnlineValue() 会发送：
@@ -1452,7 +1395,6 @@ std::string ManagerServer::handleSnapshot()
 //
 // 后续正式整合 SQLite 点表后，
 // 这里再改成 systemPointId / 数据库 point.id 的映射。
-// ============================================================
 
 std::string ManagerServer::handleForceValue(
     const std::string& payload
